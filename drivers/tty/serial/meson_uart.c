@@ -324,8 +324,13 @@ static void meson_uart_change_speed(struct uart_port *port, unsigned long baud)
 			xtal_div = 2;
 			val |= AML_UART_BAUD_XTAL_DIV2;
 		}
-		val |= DIV_ROUND_CLOSEST(port->uartclk / xtal_div, baud) - 1;
-		val |= AML_UART_BAUD_XTAL;
+		if (of_device_is_compatible(port->dev->of_node, "amlogic,meson-gxl-uart")) {
+			val = DIV_ROUND_CLOSEST(port->uartclk, 2 * baud) - 1;
+			val |= AML_UART_BAUD_XTAL | AML_UART_BAUD_XTAL_DIV2;
+		} else {
+			val |= DIV_ROUND_CLOSEST(port->uartclk / xtal_div, baud) - 1;
+			val |= AML_UART_BAUD_XTAL;
+		}
 	} else {
 		val =  DIV_ROUND_CLOSEST(port->uartclk / 4, baud) - 1;
 	}
@@ -793,6 +798,7 @@ static const struct of_device_id meson_uart_dt_match[] = {
 		.compatible = "amlogic,meson-s4-uart",
 		.data = (void *)&s4_uart_data,
 	},
+	{ .compatible = "amlogic,meson-gxl-uart" },
 	{ /* sentinel */ },
 };
 MODULE_DEVICE_TABLE(of, meson_uart_dt_match);
