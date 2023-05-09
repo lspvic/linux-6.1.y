@@ -321,11 +321,11 @@ no_leds:
 	return 0;
 }
 
-static int fd6551_remove(struct i2c_client *client)
+static void fd6551_remove(struct i2c_client *client)
 {
 	device_remove_file(&client->dev, &dev_attr_display_text);
 
-	return fd6551_display_on(client, false);
+	fd6551_display_on(client, false);
 }
 
 static void fd6551_shutdown(struct i2c_client *client)
