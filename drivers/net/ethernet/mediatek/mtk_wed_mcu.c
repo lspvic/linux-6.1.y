@@ -207,6 +207,9 @@ int mtk_wed_mcu_msg_update(struct mtk_wed_device *dev, int id, void *data,
 	if (dev->hw->version == 1)
 		return 0;
 
+	if (WARN_ON(!wo))
+		return -ENODEV;
+
 	return mtk_wed_mcu_send_msg(wo, MTK_WED_MODULE_ID_WO, id, data, len,
 				    true);
 }
@@ -323,7 +326,11 @@ mtk_wed_mcu_load_firmware(struct mtk_wed_wo *wo)
 		wo->hw->index + 1);
 
 	/* load firmware */
-	fw_name = wo->hw->index ? MT7986_FIRMWARE_WO1 : MT7986_FIRMWARE_WO0;
+	if (of_device_is_compatible(wo->hw->node, "mediatek,mt7981-wed"))
+		fw_name = MT7981_FIRMWARE_WO;
+	else
+		fw_name = wo->hw->index ? MT7986_FIRMWARE_WO1 : MT7986_FIRMWARE_WO0;
+
 	ret = request_firmware(&fw, fw_name, wo->hw->dev);
 	if (ret)
 		return ret;
@@ -383,5 +390,6 @@ int mtk_wed_mcu_init(struct mtk_wed_wo *wo)
 				  100, MTK_FW_DL_TIMEOUT);
 }
 
+MODULE_FIRMWARE(MT7981_FIRMWARE_WO);
 MODULE_FIRMWARE(MT7986_FIRMWARE_WO0);
 MODULE_FIRMWARE(MT7986_FIRMWARE_WO1);
