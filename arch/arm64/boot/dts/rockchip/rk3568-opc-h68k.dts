@@ -194,7 +194,7 @@
 
  	fan: pwm-fan {
  		compatible = "pwm-fan";
-		cooling-levels = <0 255>;
+		cooling-levels = <0 127 163 255>;
  		#cooling-cells = <2>;
  		fan-supply = <&vcc5v0_sys>;
  		pwms = <&pwm0 0 50000 0>;
@@ -243,7 +243,7 @@
 		     &gmac0_rgmii_bus>;
 	snps,reset-gpio = <&gpio2 RK_PD3 GPIO_ACTIVE_LOW>;
 	snps,reset-active-low;
-	snps,reset-delays-us = <0 20000 100000>;
+	snps,reset-delays-us = <0 50000 200000>;
 	tx_delay = <0x3c>;
 	rx_delay = <0x2f>;
 	phy-handle = <&rgmii_phy0>;
@@ -264,9 +264,9 @@
 		     &gmac1m1_rgmii_bus>;
 	snps,reset-gpio = <&gpio1 RK_PB0 GPIO_ACTIVE_LOW>;
 	snps,reset-active-low;
-	snps,reset-delays-us = <0 20000 100000>;
-	tx_delay = <0x4f>;
-	rx_delay = <0x26>;
+	snps,reset-delays-us = <0 50000 200000>;
+	tx_delay = <0x3c>;
+	rx_delay = <0x2f>;
 	phy-handle = <&rgmii_phy1>;
 	status = "okay";
 };
@@ -860,8 +860,20 @@
 
 &cpu_thermal {
 	trips {
-		cpu_hot: cpu_hot {
+		cpu_cool: cpu_cool {
 			temperature = <45000>;
+			hysteresis = <2000>;
+			type = "active";
+		};
+
+		cpu_warm: cpu_warm {
+			temperature = <55000>;
+			hysteresis = <2000>;
+			type = "active";
+		};
+
+		cpu_hot: cpu_hot {
+			temperature = <65000>;
 			hysteresis = <2000>;
 			type = "active";
 		};
@@ -869,8 +881,18 @@
 
 	cooling-maps {
 		map1 {
-			trip = <&cpu_hot>;
+			trip = <&cpu_cool>;
 			cooling-device = <&fan THERMAL_NO_LIMIT 1>;
+		};
+
+		map2 {
+			trip = <&cpu_warm>;
+			cooling-device = <&fan 2 THERMAL_NO_LIMIT>;
+		};
+
+		map3 {
+			trip = <&cpu_hot>;
+			cooling-device = <&fan 3 THERMAL_NO_LIMIT>;
 		};
 	};
 };
