@@ -573,7 +573,7 @@ ice_prepare_for_reset(struct ice_pf *pf, enum ice_reset_req reset_type)
 	/* Disable VFs until reset is completed */
 	mutex_lock(&pf->vfs.table_lock);
 	ice_for_each_vf(pf, bkt, vf)
-		ice_set_vf_state_qs_dis(vf);
+		ice_set_vf_state_dis(vf);
 	mutex_unlock(&pf->vfs.table_lock);
 
 	if (ice_is_eswitch_mode_switchdev(pf)) {
@@ -6393,10 +6393,10 @@ ice_fetch_u64_stats_per_ring(struct u64_stats_sync *syncp,
 	unsigned int start;
 
 	do {
-		start = u64_stats_fetch_begin(syncp);
+		start = u64_stats_fetch_begin_irq(syncp);
 		*pkts = stats.pkts;
 		*bytes = stats.bytes;
-	} while (u64_stats_fetch_retry(syncp, start));
+	} while (u64_stats_fetch_retry_irq(syncp, start));
 }
 
 /**

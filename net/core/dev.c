@@ -2549,6 +2549,8 @@ int __netif_set_xps_queue(struct net_device *dev, const unsigned long *mask,
 	struct xps_map *map, *new_map;
 	unsigned int nr_ids;
 
+	WARN_ON_ONCE(index >= dev->num_tx_queues);
+
 	if (dev->num_tc) {
 		/* Do not allow XPS on subordinate device directly */
 		num_tc = dev->num_tc;
@@ -3350,7 +3352,7 @@ __be16 skb_network_protocol(struct sk_buff *skb, int *depth)
 		type = eth->h_proto;
 	}
 
-	return __vlan_get_protocol(skb, type, depth);
+	return vlan_get_protocol_and_depth(skb, type, depth);
 }
 
 /* openvswitch calls this on rx path, so we need a different check.
@@ -4612,7 +4614,7 @@ static int napi_schedule_rps(struct softnet_data *sd)
 	struct softnet_data *mysd = this_cpu_ptr(&softnet_data);
 
 #ifdef CONFIG_RPS
-	if (sd != mysd) {
+	if (sd != mysd && !test_bit(NAPI_STATE_THREADED, &sd->backlog.state)) {
 		sd->rps_ipi_next = mysd->rps_ipi_list;
 		mysd->rps_ipi_list = sd;
 
@@ -5811,6 +5813,8 @@ static DEFINE_PER_CPU(struct work_struct, flush_works);
 /* Network device is going away, flush any packets still pending */
 static void flush_backlog(struct work_struct *work)
 {
+	unsigned int process_queue_empty;
+	bool threaded, flush_processq;
 	struct sk_buff *skb, *tmp;
 	struct softnet_data *sd;
 
@@ -5825,7 +5829,16 @@ static void flush_backlog(struct work_struct *work)
 			input_queue_head_incr(sd);
 		}
 	}
+
+	threaded = test_bit(NAPI_STATE_THREADED, &sd->backlog.state);
+	flush_processq = threaded &&
+			 !skb_queue_empty_lockless(&sd->process_queue);
+	if (flush_processq)
+		process_queue_empty = sd->process_queue_empty;
 	rps_unlock_irq_enable(sd);
+
+	if (threaded)
+		goto out;
 
 	skb_queue_walk_safe(&sd->process_queue, skb, tmp) {
 		if (skb->dev->reg_state == NETREG_UNREGISTERING) {
@@ -5834,7 +5847,16 @@ static void flush_backlog(struct work_struct *work)
 			input_queue_head_incr(sd);
 		}
 	}
+
+out:
 	local_bh_enable();
+
+	while (flush_processq) {
+		msleep(1);
+		rps_lock_irq_disable(sd);
+		flush_processq = process_queue_empty == sd->process_queue_empty;
+		rps_unlock_irq_enable(sd);
+	}
 }
 
 static bool flush_required(int cpu)
@@ -5966,6 +5988,7 @@ static int process_backlog(struct napi_struct *napi, int quota)
 		}
 
 		rps_lock_irq_disable(sd);
+		sd->process_queue_empty++;
 		if (skb_queue_empty(&sd->input_pkt_queue)) {
 			/*
 			 * Inline a custom version of __napi_complete().
@@ -5975,7 +5998,8 @@ static int process_backlog(struct napi_struct *napi, int quota)
 			 * We can use a plain write instead of clear_bit(),
 			 * and we dont need an smp_mb() memory barrier.
 			 */
-			napi->state = 0;
+			napi->state &= ~(NAPIF_STATE_SCHED |
+					 NAPIF_STATE_SCHED_THREADED);
 			again = false;
 		} else {
 			skb_queue_splice_tail_init(&sd->input_pkt_queue,
@@ -6390,6 +6414,55 @@ int dev_set_threaded(struct net_device *dev, bool threaded)
 	return err;
 }
 EXPORT_SYMBOL(dev_set_threaded);
+
+int backlog_set_threaded(bool threaded)
+{
+	static bool backlog_threaded;
+	int err = 0;
+	int i;
+
+	if (backlog_threaded == threaded)
+		return 0;
+
+	for_each_possible_cpu(i) {
+		struct softnet_data *sd = &per_cpu(softnet_data, i);
+		struct napi_struct *n = &sd->backlog;
+
+		if (n->thread)
+			continue;
+		n->thread = kthread_run(napi_threaded_poll, n, "napi/backlog-%d", i);
+		if (IS_ERR(n->thread)) {
+			err = PTR_ERR(n->thread);
+			pr_err("kthread_run failed with err %d\n", err);
+			n->thread = NULL;
+			threaded = false;
+			break;
+		}
+
+	}
+
+	backlog_threaded = threaded;
+
+	/* Make sure kthread is created before THREADED bit
+	 * is set.
+	 */
+	smp_mb__before_atomic();
+
+	for_each_possible_cpu(i) {
+		struct softnet_data *sd = &per_cpu(softnet_data, i);
+		struct napi_struct *n = &sd->backlog;
+		unsigned long flags;
+
+		rps_lock_irqsave(sd, &flags);
+		if (threaded)
+			n->state |= NAPIF_STATE_THREADED;
+		else
+			n->state &= ~NAPIF_STATE_THREADED;
+		rps_unlock_irq_restore(sd, &flags);
+	}
+
+	return err;
+}
 
 void netif_napi_add_weight(struct net_device *dev, struct napi_struct *napi,
 			   int (*poll)(struct napi_struct *, int), int weight)
@@ -10601,22 +10674,6 @@ void netdev_set_default_ethtool_ops(struct net_device *dev,
 }
 EXPORT_SYMBOL_GPL(netdev_set_default_ethtool_ops);
 
-/**
- * netdev_sw_irq_coalesce_default_on() - enable SW IRQ coalescing by default
- * @dev: netdev to enable the IRQ coalescing on
- *
- * Sets a conservative default for SW IRQ coalescing. Users can use
- * sysfs attributes to override the default values.
- */
-void netdev_sw_irq_coalesce_default_on(struct net_device *dev)
-{
-	WARN_ON(dev->reg_state == NETREG_REGISTERED);
-
-	dev->gro_flush_timeout = 20000;
-	dev->napi_defer_hard_irqs = 1;
-}
-EXPORT_SYMBOL_GPL(netdev_sw_irq_coalesce_default_on);
-
 void netdev_freemem(struct net_device *dev)
 {
 	char *addr = (char *)dev - dev->padded;
@@ -11179,6 +11236,9 @@ static int dev_cpu_dead(unsigned int oldcpu)
 	raise_softirq_irqoff(NET_TX_SOFTIRQ);
 	local_irq_enable();
 
+	if (test_bit(NAPI_STATE_THREADED, &oldsd->backlog.state))
+		return 0;
+
 #ifdef CONFIG_RPS
 	remsd = oldsd->rps_ipi_list;
 	oldsd->rps_ipi_list = NULL;
@@ -11482,6 +11542,7 @@ static int __init net_dev_init(void)
 		INIT_CSD(&sd->defer_csd, trigger_rx_softirq, sd);
 		spin_lock_init(&sd->defer_lock);
 
+		INIT_LIST_HEAD(&sd->backlog.poll_list);
 		init_gro_hash(&sd->backlog);
 		sd->backlog.poll = process_backlog;
 		sd->backlog.weight = weight_p;

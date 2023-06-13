@@ -30,7 +30,6 @@ connmark_tg_shift(struct sk_buff *skb, const struct xt_connmark_tginfo3 *info)
 	u_int32_t new_targetmark;
 	struct nf_conn *ct;
 	u_int32_t newmark;
-	u_int32_t oldmark;
 	u_int8_t dscp;
 
 	ct = nf_ct_get(skb, &ctinfo);
@@ -39,8 +38,7 @@ connmark_tg_shift(struct sk_buff *skb, const struct xt_connmark_tginfo3 *info)
 
 	switch (info->mode) {
 	case XT_CONNMARK_SET:
-		oldmark = READ_ONCE(ct->mark);
-		newmark = ct->mark;
+		newmark = READ_ONCE(ct->mark);
 		if (info->func & XT_CONNMARK_VALUE) {
 			newmark = (newmark & ~info->ctmask) ^ info->ctmark;
 			if (info->shift_dir == D_SHIFT_RIGHT)

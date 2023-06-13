@@ -3445,7 +3445,7 @@ static int __iwl_mvm_mac_set_key(struct ieee80211_hw *hw,
 	struct iwl_mvm_vif *mvmvif = iwl_mvm_vif_from_mac80211(vif);
 	struct iwl_mvm *mvm = IWL_MAC80211_GET_MVM(hw);
 	struct iwl_mvm_sta *mvmsta = NULL;
-	struct iwl_mvm_key_pn *ptk_pn;
+	struct iwl_mvm_key_pn *ptk_pn = NULL;
 	int keyidx = key->keyidx;
 	int ret, i;
 	u8 key_offset;
@@ -3590,6 +3590,10 @@ static int __iwl_mvm_mac_set_key(struct ieee80211_hw *hw,
 		if (ret) {
 			IWL_WARN(mvm, "set key failed\n");
 			key->hw_key_idx = STA_KEY_IDX_INVALID;
+			if (ptk_pn) {
+				RCU_INIT_POINTER(mvmsta->ptk_pn[keyidx], NULL);
+				kfree(ptk_pn);
+			}
 			/*
 			 * can't add key for RX, but we don't need it
 			 * in the device for TX so still return 0,
@@ -4840,9 +4844,6 @@ static void iwl_mvm_mac_flush(struct ieee80211_hw *hw,
 		return;
 	}
 
-	if (vif->type != NL80211_IFTYPE_STATION)
-		return;
-
 	/* Make sure we're done with the deferred traffic before flushing */
 	flush_work(&mvm->add_stream_wk);
 
@@ -4859,9 +4860,6 @@ static void iwl_mvm_mac_flush(struct ieee80211_hw *hw,
 		mvmsta = iwl_mvm_sta_from_mac80211(sta);
 		if (mvmsta->vif != vif)
 			continue;
-
-		/* make sure only TDLS peers or the AP are flushed */
-		WARN_ON(i != mvmvif->ap_sta_id && !sta->tdls);
 
 		if (drop) {
 			if (iwl_mvm_flush_sta(mvm, mvmsta, false))
@@ -4880,6 +4878,31 @@ static void iwl_mvm_mac_flush(struct ieee80211_hw *hw,
 	 */
 	if (!drop && !iwl_mvm_has_new_tx_api(mvm))
 		iwl_trans_wait_tx_queues_empty(mvm->trans, msk);
+}
+
+static void iwl_mvm_mac_flush_sta(struct ieee80211_hw *hw,
+				  struct ieee80211_vif *vif,
+				  struct ieee80211_sta *sta)
+{
+	struct iwl_mvm *mvm = IWL_MAC80211_GET_MVM(hw);
+	int i;
+
+	mutex_lock(&mvm->mutex);
+	for (i = 0; i < mvm->fw->ucode_capa.num_stations; i++) {
+		struct iwl_mvm_sta *mvmsta;
+		struct ieee80211_sta *tmp;
+
+		tmp = rcu_dereference_protected(mvm->fw_id_to_mac_id[i],
+						lockdep_is_held(&mvm->mutex));
+		if (tmp != sta)
+			continue;
+
+		mvmsta = iwl_mvm_sta_from_mac80211(sta);
+
+		if (iwl_mvm_flush_sta(mvm, mvmsta, false))
+			IWL_ERR(mvm, "flush request fail\n");
+	}
+	mutex_unlock(&mvm->mutex);
 }
 
 static int iwl_mvm_mac_get_survey(struct ieee80211_hw *hw, int idx,
@@ -5409,6 +5432,7 @@ const struct ieee80211_ops iwl_mvm_hw_ops = {
 	.mgd_complete_tx = iwl_mvm_mac_mgd_complete_tx,
 	.mgd_protect_tdls_discover = iwl_mvm_mac_mgd_protect_tdls_discover,
 	.flush = iwl_mvm_mac_flush,
+	.flush_sta = iwl_mvm_mac_flush_sta,
 	.sched_scan_start = iwl_mvm_mac_sched_scan_start,
 	.sched_scan_stop = iwl_mvm_mac_sched_scan_stop,
 	.set_key = iwl_mvm_mac_set_key,
