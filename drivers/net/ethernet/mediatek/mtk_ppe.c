@@ -75,6 +75,69 @@ static int mtk_ppe_wait_busy(struct mtk_ppe *ppe)
 	return ret;
 }
 
+static int mtk_ppe_mib_wait_busy(struct mtk_ppe *ppe)
+{
+	int ret;
+	u32 val;
+
+	ret = readl_poll_timeout_atomic(ppe->base + MTK_PPE_MIB_SER_CR, val,
+					!(val & MTK_PPE_MIB_SER_CR_ST),
+					20, MTK_PPE_WAIT_TIMEOUT_US);
+
+	if (ret)
+		dev_err(ppe->dev, "MIB table busy");
+
+	return ret;
+}
+
+static inline struct mtk_foe_accounting *
+mtk_ppe_acct_data(struct mtk_ppe *ppe, u16 index)
+{
+	if (!ppe->acct_table)
+		return NULL;
+
+	return ppe->acct_table + index * sizeof(struct mtk_foe_accounting);
+}
+
+struct mtk_foe_accounting *mtk_ppe_mib_entry_read(struct mtk_ppe *ppe, u16 index)
+{
+	u32 val, cnt_r0, cnt_r1, cnt_r2;
+	struct mtk_foe_accounting *acct;
+	int ret;
+
+	val = FIELD_PREP(MTK_PPE_MIB_SER_CR_ADDR, index) | MTK_PPE_MIB_SER_CR_ST;
+	ppe_w32(ppe, MTK_PPE_MIB_SER_CR, val);
+
+	acct = mtk_ppe_acct_data(ppe, index);
+	if (!acct)
+		return NULL;
+
+	ret = mtk_ppe_mib_wait_busy(ppe);
+	if (ret)
+		return acct;
+
+	cnt_r0 = readl(ppe->base + MTK_PPE_MIB_SER_R0);
+	cnt_r1 = readl(ppe->base + MTK_PPE_MIB_SER_R1);
+	cnt_r2 = readl(ppe->base + MTK_PPE_MIB_SER_R2);
+
+	if (mtk_is_netsys_v3_or_greater(ppe->eth)) {
+		/* 64 bit for each counter */
+		u32 cnt_r3 = readl(ppe->base + MTK_PPE_MIB_SER_R3);
+		acct->bytes += ((u64)cnt_r1 << 32) | cnt_r0;
+		acct->packets += ((u64)cnt_r3 << 32) | cnt_r2;
+	} else {
+		/* 48 bit byte counter, 40 bit packet counter */
+		u32 byte_cnt_low = FIELD_GET(MTK_PPE_MIB_SER_R0_BYTE_CNT_LOW, cnt_r0);
+		u32 byte_cnt_high = FIELD_GET(MTK_PPE_MIB_SER_R1_BYTE_CNT_HIGH, cnt_r1);
+		u32 pkt_cnt_low = FIELD_GET(MTK_PPE_MIB_SER_R1_PKT_CNT_LOW, cnt_r1);
+		u32 pkt_cnt_high = FIELD_GET(MTK_PPE_MIB_SER_R2_PKT_CNT_HIGH, cnt_r2);
+		acct->bytes += ((u64)byte_cnt_high << 32) | byte_cnt_low;
+		acct->packets += (pkt_cnt_high << 16) | pkt_cnt_low;
+	}
+
+	return acct;
+}
+
 static void mtk_ppe_cache_clear(struct mtk_ppe *ppe)
 {
 	ppe_set(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_CLEAR);
@@ -166,7 +229,7 @@ int mtk_foe_entry_prepare(struct mtk_eth *eth, struct mtk_foe_entry *entry,
 
 	memset(entry, 0, sizeof(*entry));
 
-	if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2)) {
+	if (mtk_is_netsys_v2_or_greater(eth)) {
 		val = FIELD_PREP(MTK_FOE_IB1_STATE, MTK_FOE_STATE_BIND) |
 		      FIELD_PREP(MTK_FOE_IB1_PACKET_TYPE_V2, type) |
 		      FIELD_PREP(MTK_FOE_IB1_UDP, l4proto == IPPROTO_UDP) |
@@ -230,7 +293,7 @@ int mtk_foe_entry_set_pse_port(struct mtk_eth *eth,
 	u32 *ib2 = mtk_foe_entry_ib2(eth, entry);
 	u32 val = *ib2;
 
-	if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2)) {
+	if (mtk_is_netsys_v2_or_greater(eth)) {
 		val &= ~MTK_FOE_IB2_DEST_PORT_V2;
 		val |= FIELD_PREP(MTK_FOE_IB2_DEST_PORT_V2, port);
 	} else {
@@ -381,13 +444,22 @@ int mtk_foe_entry_set_wdma(struct mtk_eth *eth, struct mtk_foe_entry *entry,
 	struct mtk_foe_mac_info *l2 = mtk_foe_entry_l2(eth, entry);
 	u32 *ib2 = mtk_foe_entry_ib2(eth, entry);
 
-	if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2)) {
+	switch (eth->soc->version) {
+	case 3:
+		*ib2 &= ~MTK_FOE_IB2_PORT_MG_V2;
+		*ib2 |=  FIELD_PREP(MTK_FOE_IB2_RX_IDX, txq) |
+			 MTK_FOE_IB2_WDMA_WINFO_V2;
+		l2->w3info = FIELD_PREP(MTK_FOE_WINFO_WCID_V3, wcid) |
+			     FIELD_PREP(MTK_FOE_WINFO_BSS_V3, bss);
+		break;
+	case 2:
 		*ib2 &= ~MTK_FOE_IB2_PORT_MG_V2;
 		*ib2 |=  FIELD_PREP(MTK_FOE_IB2_RX_IDX, txq) |
 			 MTK_FOE_IB2_WDMA_WINFO_V2;
 		l2->winfo = FIELD_PREP(MTK_FOE_WINFO_WCID, wcid) |
 			    FIELD_PREP(MTK_FOE_WINFO_BSS, bss);
-	} else {
+		break;
+	default:
 		*ib2 &= ~MTK_FOE_IB2_PORT_MG;
 		*ib2 |= MTK_FOE_IB2_WDMA_WINFO;
 		if (wdma_idx)
@@ -395,6 +467,7 @@ int mtk_foe_entry_set_wdma(struct mtk_eth *eth, struct mtk_foe_entry *entry,
 		l2->vlan2 = FIELD_PREP(MTK_FOE_VLAN2_WINFO_BSS, bss) |
 			    FIELD_PREP(MTK_FOE_VLAN2_WINFO_WCID, wcid) |
 			    FIELD_PREP(MTK_FOE_VLAN2_WINFO_RING, txq);
+		break;
 	}
 
 	return 0;
@@ -405,7 +478,7 @@ int mtk_foe_entry_set_queue(struct mtk_eth *eth, struct mtk_foe_entry *entry,
 {
 	u32 *ib2 = mtk_foe_entry_ib2(eth, entry);
 
-	if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2)) {
+	if (mtk_is_netsys_v2_or_greater(eth)) {
 		*ib2 &= ~MTK_FOE_IB2_QID_V2;
 		*ib2 |= FIELD_PREP(MTK_FOE_IB2_QID_V2, queue);
 		*ib2 |= MTK_FOE_IB2_PSE_QOS_V2;
@@ -485,11 +558,14 @@ static int __mtk_foe_entry_idle_time(struct mtk_ppe *ppe, u32 ib1)
 }
 
 static bool
-mtk_flow_entry_update(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
+mtk_flow_entry_update(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+		      u64 *packets, u64 *bytes)
 {
+	struct mtk_foe_accounting *acct;
 	struct mtk_foe_entry foe = {};
 	struct mtk_foe_entry *hwe;
 	u16 hash = entry->hash;
+	bool ret = false;
 	int len;
 
 	if (hash == 0xffff)
@@ -500,18 +576,35 @@ mtk_flow_entry_update(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
 	memcpy(&foe, hwe, len);
 
 	if (!mtk_flow_entry_match(ppe->eth, entry, &foe, len) ||
-	    FIELD_GET(MTK_FOE_IB1_STATE, foe.ib1) != MTK_FOE_STATE_BIND)
-		return false;
+	    FIELD_GET(MTK_FOE_IB1_STATE, foe.ib1) != MTK_FOE_STATE_BIND) {
+		acct = mtk_ppe_acct_data(ppe, hash);
+		if (acct) {
+			entry->prev_packets += acct->packets;
+			entry->prev_bytes += acct->bytes;
+		}
+
+		goto out;
+	}
 
 	entry->data.ib1 = foe.ib1;
+	acct = mtk_ppe_mib_entry_read(ppe, hash);
+	ret = true;
 
-	return true;
+out:
+	if (acct) {
+		*packets += acct->packets;
+		*bytes += acct->bytes;
+	}
+
+	return ret;
 }
 
 static void
 mtk_flow_entry_update_l2(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
 {
 	u32 ib1_ts_mask = mtk_get_ib1_ts_mask(ppe->eth);
+	u64 *packets = &entry->packets;
+	u64 *bytes = &entry->bytes;
 	struct mtk_flow_entry *cur;
 	struct hlist_node *tmp;
 	int idle;
@@ -520,7 +613,9 @@ mtk_flow_entry_update_l2(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
 	hlist_for_each_entry_safe(cur, tmp, &entry->l2_flows, l2_list) {
 		int cur_idle;
 
-		if (!mtk_flow_entry_update(ppe, cur)) {
+		if (!mtk_flow_entry_update(ppe, cur, packets, bytes)) {
+			entry->prev_packets += cur->prev_packets;
+			entry->prev_bytes += cur->prev_bytes;
 			__mtk_foe_entry_clear(ppe, entry, false);
 			continue;
 		}
@@ -535,15 +630,35 @@ mtk_flow_entry_update_l2(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
 	}
 }
 
+void mtk_foe_entry_get_stats(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+			     int *idle)
+{
+	entry->packets = entry->prev_packets;
+	entry->bytes = entry->prev_bytes;
+
+	spin_lock_bh(&ppe_lock);
+
+	if (entry->type == MTK_FLOW_TYPE_L2)
+		mtk_flow_entry_update_l2(ppe, entry);
+	else
+		mtk_flow_entry_update(ppe, entry, &entry->packets, &entry->bytes);
+
+	*idle = __mtk_foe_entry_idle_time(ppe, entry->data.ib1);
+
+	spin_unlock_bh(&ppe_lock);
+}
+
 static void
 __mtk_foe_entry_commit(struct mtk_ppe *ppe, struct mtk_foe_entry *entry,
 		       u16 hash)
 {
+	struct mtk_foe_accounting *acct;
 	struct mtk_eth *eth = ppe->eth;
 	u16 timestamp = mtk_eth_timestamp(eth);
 	struct mtk_foe_entry *hwe;
+	u32 val;
 
-	if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2)) {
+	if (mtk_is_netsys_v2_or_greater(eth)) {
 		entry->ib1 &= ~MTK_FOE_IB1_BIND_TIMESTAMP_V2;
 		entry->ib1 |= FIELD_PREP(MTK_FOE_IB1_BIND_TIMESTAMP_V2,
 					 timestamp);
@@ -558,7 +673,21 @@ __mtk_foe_entry_commit(struct mtk_ppe *ppe, struct mtk_foe_entry *entry,
 	wmb();
 	hwe->ib1 = entry->ib1;
 
+	if (ppe->accounting) {
+		if (mtk_is_netsys_v2_or_greater(eth))
+			val = MTK_FOE_IB2_MIB_CNT_V2;
+		else
+			val = MTK_FOE_IB2_MIB_CNT;
+		*mtk_foe_entry_ib2(eth, hwe) |= val;
+	}
+
 	dma_wmb();
+
+	acct = mtk_ppe_mib_entry_read(ppe, hash);
+	if (acct) {
+		acct->packets = 0;
+		acct->bytes = 0;
+	}
 
 	mtk_ppe_cache_clear(ppe);
 }
@@ -724,21 +853,6 @@ out:
 	spin_unlock_bh(&ppe_lock);
 }
 
-int mtk_foe_entry_idle_time(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
-{
-	int idle;
-
-	spin_lock_bh(&ppe_lock);
-	if (entry->type == MTK_FLOW_TYPE_L2)
-		mtk_flow_entry_update_l2(ppe, entry);
-	else
-		mtk_flow_entry_update(ppe, entry);
-	idle = __mtk_foe_entry_idle_time(ppe, entry->data.ib1);
-	spin_unlock_bh(&ppe_lock);
-
-	return idle;
-}
-
 int mtk_ppe_prepare_reset(struct mtk_ppe *ppe)
 {
 	if (!ppe)
@@ -766,11 +880,13 @@ int mtk_ppe_prepare_reset(struct mtk_ppe *ppe)
 	return mtk_ppe_wait_busy(ppe);
 }
 
-struct mtk_ppe *mtk_ppe_init(struct mtk_eth *eth, void __iomem *base,
-			     int version, int index)
+struct mtk_ppe *mtk_ppe_init(struct mtk_eth *eth, void __iomem *base, int index)
 {
+	bool accounting = eth->soc->has_accounting;
 	const struct mtk_soc_data *soc = eth->soc;
+	struct mtk_foe_accounting *acct;
 	struct device *dev = eth->dev;
+	struct mtk_mib_entry *mib;
 	struct mtk_ppe *ppe;
 	u32 foe_flow_size;
 	void *foe;
@@ -787,7 +903,8 @@ struct mtk_ppe *mtk_ppe_init(struct mtk_eth *eth, void __iomem *base,
 	ppe->base = base;
 	ppe->eth = eth;
 	ppe->dev = dev;
-	ppe->version = version;
+	ppe->version = eth->soc->offload_version;
+	ppe->accounting = accounting;
 
 	foe = dmam_alloc_coherent(ppe->dev,
 				  MTK_PPE_ENTRIES * soc->foe_entry_size,
@@ -802,6 +919,23 @@ struct mtk_ppe *mtk_ppe_init(struct mtk_eth *eth, void __iomem *base,
 	ppe->foe_flow = devm_kzalloc(dev, foe_flow_size, GFP_KERNEL);
 	if (!ppe->foe_flow)
 		goto err_free_l2_flows;
+
+	if (accounting) {
+		mib = dmam_alloc_coherent(ppe->dev, MTK_PPE_ENTRIES * sizeof(*mib),
+					  &ppe->mib_phys, GFP_KERNEL);
+		if (!mib)
+			return NULL;
+
+		ppe->mib_table = mib;
+
+		acct = devm_kzalloc(dev, MTK_PPE_ENTRIES * sizeof(*acct),
+				    GFP_KERNEL);
+
+		if (!acct)
+			return NULL;
+
+		ppe->acct_table = acct;
+	}
 
 	mtk_ppe_debugfs_init(ppe, index);
 
@@ -855,8 +989,7 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
 	mtk_ppe_init_foe_table(ppe);
 	ppe_w32(ppe, MTK_PPE_TB_BASE, ppe->foe_phys);
 
-	val = MTK_PPE_TB_CFG_ENTRY_80B |
-	      MTK_PPE_TB_CFG_AGE_NON_L4 |
+	val = MTK_PPE_TB_CFG_AGE_NON_L4 |
 	      MTK_PPE_TB_CFG_AGE_UNBIND |
 	      MTK_PPE_TB_CFG_AGE_TCP |
 	      MTK_PPE_TB_CFG_AGE_UDP |
@@ -870,8 +1003,10 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
 			 MTK_PPE_SCAN_MODE_KEEPALIVE_AGE) |
 	      FIELD_PREP(MTK_PPE_TB_CFG_ENTRY_NUM,
 			 MTK_PPE_ENTRIES_SHIFT);
-	if (MTK_HAS_CAPS(ppe->eth->soc->caps, MTK_NETSYS_V2))
+	if (mtk_is_netsys_v2_or_greater(ppe->eth))
 		val |= MTK_PPE_TB_CFG_INFO_SEL;
+	if (!mtk_is_netsys_v3_or_greater(ppe->eth))
+		val |= MTK_PPE_TB_CFG_ENTRY_80B;
 	ppe_w32(ppe, MTK_PPE_TB_CFG, val);
 
 	ppe_w32(ppe, MTK_PPE_IP_PROTO_CHK,
@@ -886,7 +1021,7 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
 	      MTK_PPE_FLOW_CFG_IP4_NAPT |
 	      MTK_PPE_FLOW_CFG_IP4_DSLITE |
 	      MTK_PPE_FLOW_CFG_IP4_NAT_FRAG;
-	if (MTK_HAS_CAPS(ppe->eth->soc->caps, MTK_NETSYS_V2))
+	if (mtk_is_netsys_v2_or_greater(ppe->eth))
 		val |= MTK_PPE_MD_TOAP_BYP_CRSN0 |
 		       MTK_PPE_MD_TOAP_BYP_CRSN1 |
 		       MTK_PPE_MD_TOAP_BYP_CRSN2 |
@@ -928,9 +1063,19 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
 
 	ppe_w32(ppe, MTK_PPE_DEFAULT_CPU_PORT, 0);
 
-	if (MTK_HAS_CAPS(ppe->eth->soc->caps, MTK_NETSYS_V2)) {
+	if (mtk_is_netsys_v2_or_greater(ppe->eth)) {
 		ppe_w32(ppe, MTK_PPE_DEFAULT_CPU_PORT1, 0xcb777);
 		ppe_w32(ppe, MTK_PPE_SBW_CTRL, 0x7f);
+	}
+
+	if (ppe->accounting && ppe->mib_phys) {
+		ppe_w32(ppe, MTK_PPE_MIB_TB_BASE, ppe->mib_phys);
+		ppe_m32(ppe, MTK_PPE_MIB_CFG, MTK_PPE_MIB_CFG_EN,
+			MTK_PPE_MIB_CFG_EN);
+		ppe_m32(ppe, MTK_PPE_MIB_CFG, MTK_PPE_MIB_CFG_RD_CLR,
+			MTK_PPE_MIB_CFG_RD_CLR);
+		ppe_m32(ppe, MTK_PPE_MIB_CACHE_CTL, MTK_PPE_MIB_CACHE_CTL_EN,
+			MTK_PPE_MIB_CFG_RD_CLR);
 	}
 }
 
